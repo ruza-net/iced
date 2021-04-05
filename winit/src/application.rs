@@ -91,6 +91,13 @@ pub trait Application: Program<Clipboard = Clipboard> {
     fn scale_factor(&self) -> f64 {
         1.0
     }
+
+    /// Returns whether the [`Application`] should be terminated.
+    ///
+    /// By default, it returns `false`.
+    fn should_exit(&self) -> bool {
+        false
+    }
 }
 
 /// Runs an [`Application`] with an executor, compositor, and the provided
@@ -149,10 +156,11 @@ where
         application,
         compositor,
         renderer,
-        window,
         runtime,
         debug,
         receiver,
+        window,
+        settings.exit_on_close_request,
     ));
 
     let mut context = task::Context::from_waker(task::noop_waker_ref());
@@ -164,7 +172,22 @@ where
             return;
         }
 
-        if let Some(event) = event.to_static() {
+        let event = match event {
+            winit::event::Event::WindowEvent {
+                event:
+                    winit::event::WindowEvent::ScaleFactorChanged {
+                        new_inner_size,
+                        ..
+                    },
+                window_id,
+            } => Some(winit::event::Event::WindowEvent {
+                event: winit::event::WindowEvent::Resized(*new_inner_size),
+                window_id,
+            }),
+            _ => event.to_static(),
+        };
+
+        if let Some(event) = event {
             sender.start_send(event).expect("Send event");
 
             let poll = instance.as_mut().poll(&mut context);
@@ -181,10 +204,11 @@ async fn run_instance<A, E, C>(
     mut application: A,
     mut compositor: C,
     mut renderer: A::Renderer,
-    window: winit::window::Window,
     mut runtime: Runtime<E, Proxy<A::Message>, A::Message>,
     mut debug: Debug,
     mut receiver: mpsc::UnboundedReceiver<winit::event::Event<'_, A::Message>>,
+    window: winit::window::Window,
+    exit_on_close_request: bool,
 ) where
     A: Application + 'static,
     E: Executor + 'static,
@@ -264,6 +288,8 @@ async fn run_instance<A, E, C>(
                     // Update window
                     state.synchronize(&application, &window);
 
+                    let should_exit = application.should_exit();
+
                     user_interface = ManuallyDrop::new(build_user_interface(
                         &mut application,
                         cache,
@@ -271,6 +297,10 @@ async fn run_instance<A, E, C>(
                         state.logical_size(),
                         &mut debug,
                     ));
+
+                    if should_exit {
+                        break;
+                    }
                 }
 
                 debug.draw_started();
@@ -284,11 +314,16 @@ async fn run_instance<A, E, C>(
                 messages.push(message);
             }
             event::Event::RedrawRequested(_) => {
+                let physical_size = state.physical_size();
+
+                if physical_size.width == 0 || physical_size.height == 0 {
+                    continue;
+                }
+
                 debug.render_started();
                 let current_viewport_version = state.viewport_version();
 
                 if viewport_version != current_viewport_version {
-                    let physical_size = state.physical_size();
                     let logical_size = state.logical_size();
 
                     debug.layout_started();
@@ -338,7 +373,9 @@ async fn run_instance<A, E, C>(
                 event: window_event,
                 ..
             } => {
-                if requests_exit(&window_event, state.modifiers()) {
+                if requests_exit(&window_event, state.modifiers())
+                    && exit_on_close_request
+                {
                     break;
                 }
 
